@@ -3,9 +3,11 @@
   "version": "1.0.0",
   "description": "",
   "main": "dist/index.js",
-  "scripts": {
+ // In backend-node/package.json
+
+"scripts": {
   "build": "tsc",
-  "start": "node src/dist/index.js",
+  "start": "node dist/index.js", // <--- CHANGE THIS LINE BACK TO THE SIMPLE PATH
   "dev": "nodemon src/index.ts"
 },
   "keywords": [],
