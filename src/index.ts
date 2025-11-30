@@ -20,7 +20,7 @@ const ALLOWED_ORIGINS = [
   
   // REPLACE THIS WITH YOUR LIVE VERCEL DOMAIN
   // Example domain from your previous log: "https://b2b-frontend-kwv9.vercel.app"
-  "https://[YOUR-VERCEL-DOMAIN].vercel.app", 
+  "https://b2b-frontend-kwv9.vercel.app", 
 ];
 
 const corsOptions = {
