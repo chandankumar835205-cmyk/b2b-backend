@@ -12,21 +12,33 @@ import paymentRoutes from "./routes/paymentRoutes";
 import adminRoutes from "./routes/adminRoutes"; 
 import otpRoutes from "./routes/otpRoutes"; 
 
-// --- [CRITICAL FIX: Define CORS Options] ---
-// Get your specific Vercel URL from the error logs or your Vercel dashboard.
+// --- [CRITICAL FIX: Define ROBUST CORS Options] ---
+// This list MUST include all domains that will host the frontend (the client).
 const ALLOWED_ORIGINS = [
-  "http://localhost:3000", // Local Web Testing
-  "http://localhost:8081", // Local Mobile Testing
-  
-  // REPLACE THIS WITH YOUR LIVE VERCEL DOMAIN
-  // Example domain from your previous log: "https://b2b-frontend-kwv9.vercel.app"
-  "https://b2b-frontend-kwv9.vercel.app", 
+    "http://localhost:3000", // Local Web Testing
+    "http://localhost:8081", // Local Mobile Testing
+    
+    // 1. YOUR PRIMARY VERCEL URL (Use HTTPS)
+    "https://b2b-frontend-kwv9.vercel.app", 
+
+    // 2. WILD CARD FIX: Allows ALL Vercel subdomains (e.g., branch previews)
+    /^https:\/\/.+\.vercel\.app$/,
 ];
 
 const corsOptions = {
   origin: (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
-    // If the origin is in our allowed list, or if it's a non-browser request (like cURL or Mobile App), allow it.
-    if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+    // If there is no origin (cURL, Mobile App), or the origin is explicitly allowed (string or regex), grant access.
+    const isAllowed = 
+      !origin || 
+      ALLOWED_ORIGINS.includes(origin) || 
+      ALLOWED_ORIGINS.some(pattern => {
+          if (pattern instanceof RegExp) {
+              return pattern.test(origin);
+          }
+          return false;
+      });
+
+    if (isAllowed) {
       callback(null, true);
     } else {
       callback(new Error('Not allowed by CORS'), false);
