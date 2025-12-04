@@ -6,20 +6,27 @@ import { Request } from "express";
 
 dotenv.config();
 
+// Cloudinary Configuration
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
+// Correctly typed Cloudinary Storage
 const storage = new CloudinaryStorage({
-  cloudinary: cloudinary,
-  params: async (req: Request, file: Express.Multer.File) => {
+  cloudinary,
+  params: async (
+    req: Request,
+    file: Express.Multer.File
+  ): Promise<Record<string, unknown>> => {
     return {
       folder: "b2b_products",
       allowed_formats: ["jpg", "png", "jpeg", "webp"],
+      public_id: `${Date.now()}-${file.originalname}`, // optional but recommended
     };
   },
 });
 
+// Multer Upload Middleware
 export const upload = multer({ storage });
