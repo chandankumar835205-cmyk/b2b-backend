@@ -1,45 +1,54 @@
 import { Request, Response, NextFunction } from "express";
-import jwt from "jsonwebtoken";
+import jwt, { JwtPayload, VerifyErrors } from "jsonwebtoken";
 import User from "../models/User";
 
-// Extend Request interface to include user
 export interface AuthRequest extends Request {
   user?: any;
 }
 
 export const protect = async (req: AuthRequest, res: Response, next: NextFunction) => {
-  let token;
+  let token: string | undefined;
 
   if (req.headers.authorization && req.headers.authorization.startsWith("Bearer")) {
     try {
-      // Get token from header
       token = req.headers.authorization.split(" ")[1];
 
-      // Verify token
-      const decoded: any = jwt.verify(token, process.env.JWT_SECRET_KEY || "secret");
+      const decoded = jwt.verify(
+        token,
+        process.env.JWT_SECRET_KEY!
+      ) as JwtPayload;
 
-      // Get user from the token
+      // Get user data
       req.user = await User.findById(decoded.id).select("-hashed_password");
 
-      next();
+      if (!req.user) {
+        res.status(401).json({ detail: "User does not exist" });
+        return; // 🔥 CRITICAL
+      }
+
+      return next(); // ✔ Continue only here
+
     } catch (error) {
       res.status(401).json({ detail: "Not authorized, token failed" });
+      return; // 🔥 CRITICAL
     }
   }
 
-  if (!token) {
-    res.status(401).json({ detail: "Not authorized, no token" });
-  }
+  // No token found
+  res.status(401).json({ detail: "Not authorized, no token" });
+  return; // 🔥 CRITICAL
 };
 
-// Middleware to check for specific roles
+
+// ROLE AUTHORIZATION (also needs return)
 export const authorize = (...roles: string[]) => {
   return (req: AuthRequest, res: Response, next: NextFunction) => {
     if (!req.user || !roles.includes(req.user.role)) {
-      return res.status(403).json({ 
-        detail: `User role ${req.user?.role} is not authorized to access this route` 
+      res.status(403).json({
+        detail: `User role ${req.user?.role} is not authorized to access this route`,
       });
+      return; // 🔥 CRITICAL
     }
-    next();
+    next(); // ✔ OK
   };
 };

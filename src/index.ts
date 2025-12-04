@@ -1,8 +1,11 @@
+
+
 import dotenv from "dotenv";
 dotenv.config(); // Load config immediately
-
+import { CorsOptions } from "cors";
 import express from "express";
 import cors from "cors";
+
 import morgan from "morgan";
 import connectDB from "./config/db";
 import authRoutes from "./routes/authRoutes";
@@ -25,27 +28,31 @@ const ALLOWED_ORIGINS = [
     /^https:\/\/.+\.vercel\.app$/,
 ];
 
-const corsOptions = {
-  origin: (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
-    // If there is no origin (cURL, Mobile App), or the origin is explicitly allowed (string or regex), grant access.
-    const isAllowed = 
-      !origin || 
-      ALLOWED_ORIGINS.includes(origin) || 
-      ALLOWED_ORIGINS.some(pattern => {
-          if (pattern instanceof RegExp) {
-              return pattern.test(origin);
-          }
-          return false;
-      });
 
-    if (isAllowed) {
+
+const corsOptions: CorsOptions = {
+  origin: (origin, callback) => {
+    // Allow mobile app (no Origin header)
+    if (!origin) {
+      return callback(null, true);
+    }
+
+    const allowed =
+      ALLOWED_ORIGINS.includes(origin) ||
+      ALLOWED_ORIGINS.some(p => p instanceof RegExp && p.test(origin));
+
+    if (allowed) {
       callback(null, true);
     } else {
-      callback(new Error('Not allowed by CORS'), false);
+      console.error("CORS blocked origin:", origin);
+      callback(new Error("Not allowed by CORS"));
     }
   },
-  credentials: true, // Allows JWTs and session cookies to be sent
+  credentials: true,
+  optionsSuccessStatus: 200,
 };
+
+
 // ------------------------------------------
 
 // Connect to Database
@@ -55,24 +62,22 @@ const app = express();
 
 // Middleware
 app.use(express.json());
-app.use(express.urlencoded({ extended: true })); 
-app.use(morgan("dev")); 
 
-// Apply the WHITELISTED CORS policy
-app.use(cors(corsOptions)); 
+app.use(express.urlencoded({ extended: true }));
 
-// Routes
-app.get("/", (req, res) => {
-  res.json({ message: "API is running (Node.js)" });
-});
+// CORS ALWAYS BEFORE routes
+app.use(cors());
 
+// ROUTES
 app.use("/auth", authRoutes);
 app.use("/otp", otpRoutes);
 app.use("/products", productRoutes);
-app.use("/orders", orderRoutes); 
+app.use("/orders", orderRoutes);
 app.use("/payments", paymentRoutes);
-app.use("/admin", adminRoutes); 
+app.use("/admin", adminRoutes);
 
+// MORGAN MUST BE LAST (AFTER ROUTES)
+app.use(morgan("dev"));
 
 // Start Server
 const PORT = process.env.PORT || 8000;

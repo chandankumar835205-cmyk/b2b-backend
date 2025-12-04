@@ -2,6 +2,7 @@ import { v2 as cloudinary } from "cloudinary";
 import { CloudinaryStorage } from "multer-storage-cloudinary";
 import multer from "multer";
 import dotenv from "dotenv";
+import { Request } from "express";
 
 dotenv.config();
 
@@ -13,7 +14,7 @@ cloudinary.config({
 
 const storage = new CloudinaryStorage({
   cloudinary: cloudinary,
-  params: async (req, file) => {
+  params: async (req: Request, file: Express.Multer.File) => {
     return {
       folder: "b2b_products",
       allowed_formats: ["jpg", "png", "jpeg", "webp"],
@@ -21,4 +22,4 @@ const storage = new CloudinaryStorage({
   },
 });
 
-export const upload = multer({ storage: storage });
+export const upload = multer({ storage });
