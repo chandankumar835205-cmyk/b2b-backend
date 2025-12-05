@@ -29,7 +29,9 @@
     "multer-storage-cloudinary": "3.0.0",
     "pdfkit": "^0.17.2",
     "razorpay": "^2.9.6",
-    "zod": "^4.1.13"
+    "zod": "^4.1.13",
+    "force_rebuild": "1.0.0"
+
   },
   "devDependencies": {
     "@types/bcryptjs": "^2.4.6",
