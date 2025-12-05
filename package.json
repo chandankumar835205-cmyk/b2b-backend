@@ -29,8 +29,8 @@
     "multer-storage-cloudinary": "3.0.0",
     "pdfkit": "^0.17.2",
     "razorpay": "^2.9.6",
-    "zod": "^4.1.13",
-    "force_rebuild": "1.0.0"
+    "zod": "^4.1.13"
+    
 
   },
   "devDependencies": {
@@ -43,6 +43,7 @@
     "@types/node": "^24.10.1",
     "nodemon": "^3.1.11",
     "ts-node": "^10.9.2",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+     "force_rebuild": "0.0.0"
   }
 }
