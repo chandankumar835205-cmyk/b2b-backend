@@ -17,42 +17,39 @@ export const blockCheck = (req: AuthRequest, res: Response, next: NextFunction) 
 
 export const protect = async (req: AuthRequest, res: Response, next: NextFunction) => {
   let token: string | undefined;
+if (req.query.token) {
+  req.headers.authorization = `Bearer ${req.query.token}`;
+}
 
-  try {
-    // 1. Token from query → FIRST PRIORITY
-    if (req.query.token) {
-      token = String(req.query.token);
-    }
-
-    // 2. Token from Authorization header
-    else if (
-      req.headers.authorization &&
-      req.headers.authorization.startsWith("Bearer")
-    ) {
+  if (req.headers.authorization && req.headers.authorization.startsWith("Bearer")) {
+    try {
       token = req.headers.authorization.split(" ")[1];
+
+      const decoded = jwt.verify(
+        token,
+        process.env.JWT_SECRET_KEY!
+      ) as JwtPayload;
+
+      // Get user data
+      req.user = await User.findById(decoded.id).select("-hashed_password");
+
+      if (!req.user) {
+        res.status(401).json({ detail: "User does not exist" });
+        return; // 🔥 CRITICAL
+      }
+
+      return next(); // ✔ Continue only here
+
+    } catch (error) {
+      res.status(401).json({ detail: "Not authorized, token failed" });
+      return; // 🔥 CRITICAL
     }
-
-    if (!token) {
-      return res.status(401).json({ detail: "Not authorized, no token" });
-    }
-
-    const decoded = jwt.verify(
-      token,
-      process.env.JWT_SECRET_KEY!
-    ) as JwtPayload;
-
-    req.user = await User.findById(decoded.id).select("-hashed_password");
-
-    if (!req.user) {
-      return res.status(401).json({ detail: "User does not exist" });
-    }
-
-    next();
-  } catch (error) {
-    return res.status(401).json({ detail: "Not authorized, token failed" });
   }
-};
 
+  // No token found
+  res.status(401).json({ detail: "Not authorized, no token" });
+  return; // 🔥 CRITICAL
+};
 
 
 // ROLE AUTHORIZATION (also needs return)
