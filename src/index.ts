@@ -18,8 +18,10 @@ import otpRoutes from "./routes/otpRoutes";
 // --- [CRITICAL FIX: Define ROBUST CORS Options] ---
 // This list MUST include all domains that will host the frontend (the client).
 const ALLOWED_ORIGINS = [
-    "http://localhost:3000", // Local Web Testing
-    "http://localhost:8081", // Local Mobile Testing
+    //"http://localhost:3000", // Local Web Testing
+    "http://localhost:8081",
+    "http://10.203.124.214:3000",
+ // Local Mobile Testing
     
     // 1. YOUR PRIMARY VERCEL URL (Use HTTPS)
     "https://b2b-frontend-kwv9.vercel.app", 

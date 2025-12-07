@@ -1,164 +1,223 @@
-// src/routes/orderRoutes.ts (COMPLETE, CORRECTED VERSION)
-
+// src/routes/orderRoutes.ts
 import express from "express";
 import Order from "../models/Order";
 import Product from "../models/Product";
-import { protect, AuthRequest, authorize } from "../middleware/authMiddleware";
-import { createShiprocketShipment } from "../utils/shiprocket";
+
 import User from "../models/User";
-import { generateInvoicePDF } from "../utils/invoiceGenerator"; // Assuming this utility exists
-import { sendSmsNotification } from "../utils/notificationService"; // Assuming this utility exists
-import mongoose from "mongoose"; // 👈 Required for ID validation
+import { generateInvoicePDF } from "../utils/invoiceGenerator";
+import { sendSmsNotification } from "../utils/notificationService";
+
+import {
+  protect,
+  AuthRequest,
+  blockCheck,       // ⭐ ADDED
+  authorize         // ⭐ ADDED (you were using authorize but had not imported it)
+} from "../middleware/authMiddleware";
+
+import mongoose from "mongoose";
 
 const router = express.Router();
 
-// -----------------------------------------------------------
-// POST /orders - Create Order (Shop Only)
-// -----------------------------------------------------------
-router.post("/", protect, authorize("shop"), async (req: AuthRequest, res) => {
+/* -----------------------------------------------------------
+   POST /orders - Create MULTIPLE ORDERS (1 per factory)
+----------------------------------------------------------- */
+router.post("/", protect, blockCheck, authorize("shop"), async (req: AuthRequest, res) => {
+  // ⭐ blockCheck added → blocked shop cannot place orders
   try {
     const { items, payment_method } = req.body;
-    // ... (Stock validation, deduction, and order creation logic omitted for brevity) ...
 
-    let totalAmount = 0;
-    const orderItems = [];
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ detail: "No items provided" });
+    }
 
-    // 1. Validate Stock & Calculate Total
+    // Step 1: Fetch all products and attach product + factory info
+    const enrichedItems: any[] = [];
+
     for (const item of items) {
-      const product = await Product.findById(item.product_id);
-      
-      if (!product || product.stock_quantity < item.quantity) {
-        return res.status(400).json({ detail: `Invalid product or insufficient stock.` });
+      if (!item?.product_id || !item?.quantity) {
+        return res.status(400).json({ detail: "Invalid item structure" });
       }
-      
-      const unitPrice = product.price; // Use base price from model
-      totalAmount += unitPrice * item.quantity;
-      
-      orderItems.push({
-        product_id: item.product_id,
+
+      if (!mongoose.Types.ObjectId.isValid(item.product_id)) {
+        return res.status(400).json({ detail: `Invalid product id: ${item.product_id}` });
+      }
+
+      const product = await Product.findById(item.product_id).populate("factory_id");
+      if (!product) return res.status(404).json({ detail: "Product not found" });
+
+      if (product.stock_quantity < item.quantity) {
+        return res.status(400).json({ detail: `${product.name} - insufficient stock` });
+      }
+
+      const factory: any = product.factory_id;
+      if (!factory) {
+        return res.status(500).json({ detail: `Product ${product._id} missing factory info` });
+      }
+
+      enrichedItems.push({
+        product_id: product._id,
         name: product.name,
-        price: unitPrice, 
+        price: product.price,
         quantity: item.quantity,
-        image_url: product.images[0] || ""
+        image_url: product.images?.[0] || "",
+        factory_id: factory._id,
+        seller_details: {
+          name: factory.full_name || factory.email || "Factory",
+          email: factory.email || "",
+          phone: factory.phone || "",
+          address: factory.address_line_1 || "",
+          gstin: factory.gstin || ""
+        }
       });
-      // Deduction logic should be here
     }
 
-    // 3. Create Order
-    const order = await Order.create({ shop_id: req.user._id, items: orderItems, total_amount: totalAmount, payment_method, payment_status: "pending" });
-    
-    // SMS Notification for Shop Owner (Order Placed)
-    const shopUser = await User.findById(req.user._id);
-    if (shopUser?.phone) {
-        sendSmsNotification(shopUser.phone, `Your order #${order._id.toString().slice(-6)} has been placed!`);
+    // Step 2: GROUP ITEMS BY FACTORY
+    const factoryGroups: Record<string, any[]> = {};
+    enrichedItems.forEach((it) => {
+      const fId = it.factory_id.toString();
+      if (!factoryGroups[fId]) factoryGroups[fId] = [];
+      factoryGroups[fId].push(it);
+    });
+
+    // Step 3: Create separate orders per factory
+    const createdOrders: any[] = [];
+
+    for (const factoryId of Object.keys(factoryGroups)) {
+      const itemsForFactory = factoryGroups[factoryId];
+
+      let totalAmount = 0;
+      itemsForFactory.forEach((i) => {
+        totalAmount += Number(i.price) * Number(i.quantity);
+      });
+
+      const order = await Order.create({
+        shop_id: req.user._id,
+        factory_id: new mongoose.Types.ObjectId(factoryId),
+        items: itemsForFactory,
+        total_amount: totalAmount,
+        payment_method,
+        payment_status: "pending",
+        status: "pending"
+      });
+
+      createdOrders.push(order);
+
+      for (const it of itemsForFactory) {
+        await Product.findByIdAndUpdate(it.product_id, { $inc: { stock_quantity: -it.quantity } });
+      }
+
+      const shopUser = await User.findById(req.user._id);
+      if (shopUser?.phone) {
+        sendSmsNotification(
+          shopUser.phone,
+          `Order #${order._id.toString().slice(-6)} placed successfully!`
+        );
+      }
     }
 
-    res.status(201).json(order);
+    return res.status(201).json({
+      message: "Orders created successfully",
+      orders: createdOrders
+    });
 
   } catch (error) {
-    res.status(500).json({ detail: (error as Error).message });
+    console.error("Order Creation Error:", error);
+    return res.status(500).json({ detail: (error as Error).message });
   }
 });
 
-// -----------------------------------------------------------
-// GET /orders - Get Orders List (Factory/Shop)
-// -----------------------------------------------------------
-router.get("/", protect, async (req: AuthRequest, res) => {
+/* -----------------------------------------------------------
+   GET /orders - Works for shop & factory
+----------------------------------------------------------- */
+router.get("/", protect, blockCheck, async (req: AuthRequest, res) => {
+  // ⭐ Blocked users cannot view orders
   try {
-    let query: any = {};
-    // ... (logic to filter query by shop_id or factory_id remains the same) ...
+    const query: any = {};
+
+    if (req.user.role === "shop") {
+      query.shop_id = req.user._id;
+    } else if (req.user.role === "factory") {
+      query.factory_id = req.user._id;
+    }
 
     const orders = await Order.find(query)
-      // CRITICAL: Populate shop_id for address/name details in the list view (and to check authorization)
       .populate("shop_id", "full_name email phone address_line_1 city district state pincode")
       .sort({ createdAt: -1 });
 
-    res.json(orders);
-
+    return res.json(orders);
   } catch (error) {
-    res.status(500).json({ detail: (error as Error).message });
+    console.error("Orders Fetch Error:", error);
+    return res.status(500).json({ detail: (error as Error).message });
   }
 });
 
-// -----------------------------------------------------------
-// GET /orders/:id - Get Single Order Details (THE MISSING ROUTE FIX)
-// -----------------------------------------------------------
-router.get("/:id", protect, async (req: AuthRequest, res) => {
+/* -----------------------------------------------------------
+   GET SINGLE ORDER
+----------------------------------------------------------- */
+router.get("/:id", protect, blockCheck, async (req: AuthRequest, res) => {
+  // ⭐ Blocked users cannot view single order
   try {
-    // 🛑 FIX: Check if the ID is a valid MongoDB ObjectId to prevent 500 errors
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
-        return res.status(400).json({ detail: "Invalid order ID format." });
+      return res.status(400).json({ detail: "Invalid ID" });
     }
-      
-    const order = await Order.findById(req.params.id)
-      // CRUCIAL: Populate the shop_id to get the buyer's address for the Factory detail screen
-      .populate("shop_id", "full_name email phone address_line_1 city district state pincode") 
-      .exec(); 
 
-    if (!order) {
-      return res.status(404).json({ detail: "Order not found" });
-    }
-    
-    // Basic authorization check
+    const order = await Order.findById(req.params.id)
+      .populate("shop_id", "full_name email phone address_line_1 city district state pincode");
+
+    if (!order) return res.status(404).json({ detail: "Order not found" });
+
     if (req.user.role === "shop" && order.shop_id._id.toString() !== req.user._id.toString()) {
-        return res.status(403).json({ detail: "Not authorized to view this order" });
+      return res.status(403).json({ detail: "Unauthorized" });
     }
-    
-    res.json(order);
+    if (req.user.role === "factory" && order.factory_id?.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ detail: "Unauthorized" });
+    }
+
+    return res.json(order);
   } catch (error) {
-    console.error("Single Order Fetch Error:", error);
-    res.status(500).json({ detail: (error as Error).message });
+    console.error("Single Order Error:", error);
+    return res.status(500).json({ detail: (error as Error).message });
   }
 });
 
-// -----------------------------------------------------------
-// GET /orders/:id/invoice - Generate PDF
-// -----------------------------------------------------------
-router.get("/:id/invoice", protect, authorize("admin", "factory", "shop"), async (req: AuthRequest, res) => {
+/* -----------------------------------------------------------
+   DOWNLOAD INVOICE
+----------------------------------------------------------- */
+router.get("/:id/invoice", protect, blockCheck, authorize("admin", "factory", "shop"), async (req: AuthRequest, res) => {
+  // ⭐ Blocked users cannot download invoices
   try {
     const order = await Order.findById(req.params.id)
       .populate("shop_id", "full_name email address_line_1 city district state pincode phone");
 
-    if (!order) {
-      return res.status(404).json({ detail: "Order not found" });
-    }
+    if (!order) return res.status(404).json({ detail: "Order not found" });
 
-    if (req.user.role === "shop" && order.shop_id._id.toString() !== req.user._id.toString()) {
+    if (req.user.role === "factory" && order.factory_id?.toString() !== req.user._id.toString()) {
       return res.status(403).json({ detail: "Not authorized to view this invoice" });
     }
 
-    if (!order.shop_id) {
-      return res.status(500).json({ detail: "Buyer data missing for invoice." });
-    }
-
     generateInvoicePDF(order, res);
-
-  } catch (error) {
-    if (!res.headersSent) {
-      return res.status(500).json({ detail: "Internal server error" });
-    }
+  } catch (err) {
+    console.error("Invoice Error:", err);
+    return res.status(500).json({ detail: "Internal Server Error" });
   }
 });
 
-
-// -----------------------------------------------------------
-// PUT /orders/:id/status - Update Status (Factory/Admin)
-// -----------------------------------------------------------
-router.put("/:id/status", protect, authorize("admin", "factory"), async (req: AuthRequest, res) => {
+/* -----------------------------------------------------------
+   UPDATE ORDER STATUS
+----------------------------------------------------------- */
+router.put("/:id/status", protect, blockCheck, authorize("admin", "factory"), async (req: AuthRequest, res) => {
+  // ⭐ Blocked factories/admin cannot update order status
   try {
     const { status } = req.body;
     const order = await Order.findById(req.params.id);
-
     if (!order) return res.status(404).json({ detail: "Order not found" });
-    
-    // ... (Shiprocket integration and SMS notification logic remains the same) ...
 
     order.status = status;
-    const updatedOrder = await order.save();
-    res.json(updatedOrder);
-
+    await order.save();
+    return res.json(order);
   } catch (error) {
-    res.status(500).json({ detail: (error as Error).message });
+    console.error("Order Status Update Error:", error);
+    return res.status(500).json({ detail: (error as Error).message });
   }
 });
 

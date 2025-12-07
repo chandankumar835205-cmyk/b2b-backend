@@ -17,6 +17,12 @@ const userSchema = new mongoose.Schema(
     district: {type: String, default: ""},
     state: { type: String, default: "" },
     pincode: { type: String, default: "" },
+
+     is_blocked: {
+  type: Boolean,
+  default: false,
+}
+
   },
   { timestamps: true }
 );
@@ -28,7 +34,7 @@ userSchema.set('toJSON', {
   transform: function (doc, ret) {
     // We cast 'ret' to 'any' to stop TypeScript from complaining
     // about deleting required properties.
-    delete (ret as any)._id;
+    //delete (ret as any)._id;
     delete (ret as any).hashed_password;
   }
 });

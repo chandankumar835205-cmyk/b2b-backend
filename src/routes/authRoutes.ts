@@ -55,10 +55,14 @@ router.post("/login", async (req, res) => {
       const access_token = generateToken(user._id.toString(), user.role, user.email);
       
       res.json({
-        access_token,
-        token_type: "bearer",
-        user
-      });
+  access_token,
+  token_type: "bearer",
+  user: {
+    ...user.toObject(),
+    is_blocked: user.is_blocked
+  }
+});
+
     } else {
       res.status(401).json({ detail: "Incorrect email or password" });
     }

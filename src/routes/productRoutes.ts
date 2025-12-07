@@ -71,6 +71,8 @@ router.post("/", protect, authorize("admin", "factory"), async (req: AuthRequest
   }
 });
 
+
+
 // PUT /products/:id - Update Product
 router.put("/:id", protect, authorize("admin", "factory"), async (req: AuthRequest, res) => {
   try {
