@@ -29,6 +29,32 @@ router.get("/", async (req, res) => {
   }
 });
 
+
+// GET /products/suggest?search=bi → ["Biscuit", "Bisleri"] added on 8th night-or 9th
+
+
+router.get("/suggest", async (req, res) => {
+  try {
+    const search = (req.query.search as string) || "";
+
+    if (!search.trim()) return res.json([]);
+
+    const regex = new RegExp("^" + search, "i");
+
+    const products = await Product.find(
+      { name: { $regex: regex } },
+      { name: 1 }
+    ).limit(8);
+
+    const names: string[] = products.map((p: any) => p.name || "");
+
+    res.json(names);
+  } catch (error: any) {
+    res.status(500).json({ detail: error.message });
+  }
+});
+
+
 // GET /products/:id - Get single product
 router.get("/:id", async (req, res) => {
   try {
@@ -95,6 +121,11 @@ router.put("/:id", protect, authorize("admin", "factory"), async (req: AuthReque
   }
 });
 
+
+
+
+
+
 // POST /products/:id/upload-image - Upload Image
 router.post("/:id/upload-image", protect, authorize("admin", "factory"), upload.single("file"), async (req: AuthRequest, res: any) => {
   try {
@@ -122,5 +153,10 @@ router.post("/:id/upload-image", protect, authorize("admin", "factory"), upload.
     res.status(500).json({ detail: (error as Error).message });
   }
 });
+
+
+
+
+
 
 export default router;
