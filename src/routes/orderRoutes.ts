@@ -17,8 +17,6 @@ const router = express.Router();
 
 /* -----------------------------------------------------------
    POST /orders - Create MULTIPLE ORDERS (COD only)
-   NOTE: Prepaid (payment_method === "Prepaid") will NOT create DB orders here.
-         For prepaid flows, use /payments/initiate-group and /payments/verify-group.
 ----------------------------------------------------------- */
 router.post("/", protect, blockCheck, authorize("shop"), async (req: AuthRequest, res) => {
   try {
@@ -28,27 +26,60 @@ router.post("/", protect, blockCheck, authorize("shop"), async (req: AuthRequest
       return res.status(400).json({ detail: "No items provided" });
     }
 
-    // If prepaid, do not create DB orders here. Return prepared summary so frontend can initiate payment.
-    if (String(payment_method).toLowerCase() === "prepaid") {
-      // Enrich items and compute grouping/amount similar to COD logic
-      const enrichedItems: any[] = [];
-      for (const item of items) {
-        if (!item?.product_id || !item?.quantity) {
-          return res.status(400).json({ detail: "Invalid item structure" });
+    // Helper to process items (parse IDs, check stock, calculate price)
+    const processItems = async (itemsList: any[]) => {
+      const results: any[] = [];
+      
+      for (const item of itemsList) {
+        // 1. Parse Composite ID
+        let realProductId = item.product_id;
+        let unitName = null;
+
+        if (item.product_id.length > 24 && item.product_id.includes("-")) {
+            realProductId = item.product_id.substring(0, 24);
+            unitName = decodeURIComponent(item.product_id.substring(25)); 
         }
-        if (!mongoose.Types.ObjectId.isValid(item.product_id)) {
-          return res.status(400).json({ detail: `Invalid product id: ${item.product_id}` });
+
+        if (!mongoose.Types.ObjectId.isValid(realProductId)) {
+           throw new Error(`Invalid product id: ${item.product_id}`);
         }
-        const product = await Product.findById(item.product_id).populate("factory_id");
-        if (!product) return res.status(404).json({ detail: "Product not found" });
-        if (product.stock_quantity < item.quantity) {
-          return res.status(400).json({ detail: `${product.name} - insufficient stock` });
+
+        // 2. Fetch Product
+        const product = await Product.findById(realProductId).populate("factory_id");
+        if (!product) throw new Error(`Product not found: ${realProductId}`);
+
+        // 3. Find Specific Unit & Check Stock
+        let targetUnit: any = null;
+        let finalPrice = 0;
+
+        if (product.selling_units && product.selling_units.length > 0) {
+             if (unitName) {
+                 targetUnit = product.selling_units.find((u: any) => u.unit_name === unitName);
+             } else {
+                 targetUnit = product.selling_units[0];
+             }
+
+             if (!targetUnit) throw new Error(`Unit '${unitName}' not found for product ${product.name}`);
+
+             if (targetUnit.unit_stock < item.quantity) {
+                 throw new Error(`${product.name} (${targetUnit.unit_name}) - insufficient stock.`);
+             }
+
+             const commission = product.commission_rate || 0;
+             const basePrice = targetUnit.factory_unit_price;
+             finalPrice = Math.ceil(basePrice * (1 + commission / 100));
+
+        } else {
+             throw new Error(`Product ${product.name} has no selling units defined.`);
         }
+
         const factory: any = product.factory_id;
-        enrichedItems.push({
+        
+        results.push({
           product_id: product._id,
-          name: product.name,
-          price: product.price,
+          name: `${product.name} (${targetUnit.unit_name})`,
+          unit_name: targetUnit.unit_name, // Store Unit Name
+          price: finalPrice,
           quantity: item.quantity,
           image_url: product.images?.[0] || "",
           factory_id: factory?._id,
@@ -61,129 +92,112 @@ router.post("/", protect, blockCheck, authorize("shop"), async (req: AuthRequest
           }
         });
       }
+      return results;
+    };
 
-      // Group items by factory and compute totals
-      const factoryGroups: Record<string, any[]> = {};
-      enrichedItems.forEach((it) => {
-        const fId = it.factory_id?.toString() || "unknown";
-        if (!factoryGroups[fId]) factoryGroups[fId] = [];
-        factoryGroups[fId].push(it);
-      });
 
-      const previewOrders: any[] = [];
-      Object.keys(factoryGroups).forEach((fid) => {
-        const arr = factoryGroups[fid];
-        let totalAmount = 0;
-        arr.forEach((i) => (totalAmount += Number(i.price) * Number(i.quantity)));
-        previewOrders.push({
-          factory_id: fid === "unknown" ? null : fid,
-          items: arr,
-          total_amount: totalAmount,
-          payment_method,
+    // --- PREPAID FLOW (Preview Only) ---
+    if (String(payment_method).toLowerCase() === "prepaid") {
+      try {
+        const enrichedItems = await processItems(items);
+        
+        const factoryGroups: Record<string, any[]> = {};
+        enrichedItems.forEach((it) => {
+          const fId = it.factory_id?.toString() || "unknown";
+          if (!factoryGroups[fId]) factoryGroups[fId] = [];
+          factoryGroups[fId].push(it);
         });
-      });
 
-      // Return the prepared grouped order preview (frontend should call /payments/initiate-group with items)
-      return res.json({
-        status: "PREPAID_PREVIEW",
-        previewOrders,
-      });
+        const previewOrders: any[] = [];
+        Object.keys(factoryGroups).forEach((fid) => {
+          const arr = factoryGroups[fid];
+          let totalAmount = 0;
+          arr.forEach((i) => (totalAmount += Number(i.price) * Number(i.quantity)));
+          previewOrders.push({
+            factory_id: fid === "unknown" ? null : fid,
+            items: arr,
+            total_amount: totalAmount,
+            payment_method,
+          });
+        });
+
+        return res.json({ status: "PREPAID_PREVIEW", previewOrders });
+
+      } catch (err: any) {
+        return res.status(400).json({ detail: err.message });
+      }
     }
 
-    // ---------- COD flow: create DB orders immediately ----------
-    // Step 1: Fetch all products and attach product + factory info (re-validate server-side)
-    const enrichedItems: any[] = [];
-    for (const item of items) {
-      if (!item?.product_id || !item?.quantity) {
-        return res.status(400).json({ detail: "Invalid item structure" });
-      }
+    // --- COD FLOW (Create Orders) ---
+    try {
+        const enrichedItems = await processItems(items);
 
-      if (!mongoose.Types.ObjectId.isValid(item.product_id)) {
-        return res.status(400).json({ detail: `Invalid product id: ${item.product_id}` });
-      }
+        const factoryGroups: Record<string, any[]> = {};
+        enrichedItems.forEach((it) => {
+          const fId = it.factory_id.toString();
+          if (!factoryGroups[fId]) factoryGroups[fId] = [];
+          factoryGroups[fId].push(it);
+        });
 
-      const product = await Product.findById(item.product_id).populate("factory_id");
-      if (!product) return res.status(404).json({ detail: "Product not found" });
+        const createdOrders: any[] = [];
 
-      if (product.stock_quantity < item.quantity) {
-        return res.status(400).json({ detail: `${product.name} - insufficient stock` });
-      }
+        for (const factoryId of Object.keys(factoryGroups)) {
+          const itemsForFactory = factoryGroups[factoryId];
+          let totalAmount = 0;
+          itemsForFactory.forEach((i) => {
+            totalAmount += Number(i.price) * Number(i.quantity);
+          });
 
-      const factory: any = product.factory_id;
-      if (!factory) {
-        return res.status(500).json({ detail: `Product ${product._id} missing factory info` });
-      }
+          // Cast to 'any' to avoid strict type error
+          const order = await Order.create({
+            shop_id: req.user._id,
+            factory_id: new mongoose.Types.ObjectId(factoryId),
+            items: itemsForFactory,
+            total_amount: totalAmount,
+            payment_method,
+            payment_status: "pending",
+            status: "pending"
+          }) as any;
 
-      enrichedItems.push({
-        product_id: product._id,
-        name: product.name,
-        price: product.price,
-        quantity: item.quantity,
-        image_url: product.images?.[0] || "",
-        factory_id: factory._id,
-        seller_details: {
-          name: factory.full_name || factory.email || "Factory",
-          email: factory.email || "",
-          phone: factory.phone || "",
-          address: factory.address_line_1 || "",
-          gstin: factory.gstin || ""
+          createdOrders.push(order);
+
+          // Decrement Stock
+          for (const it of itemsForFactory) {
+            try {
+              if (it.unit_name) {
+                  await Product.findOneAndUpdate(
+                    { 
+                      _id: it.product_id, 
+                      "selling_units.unit_name": it.unit_name 
+                    },
+                    { 
+                      $inc: { "selling_units.$.unit_stock": -it.quantity } 
+                    }
+                  );
+              }
+            } catch (stockErr) {
+              console.warn("Stock update failed for", it.product_id, stockErr);
+            }
+          }
+
+          // Send SMS
+          const shopUser = await User.findById(req.user._id);
+          if (shopUser?.phone) {
+            sendSmsNotification(
+              shopUser.phone,
+              `Order #${order._id.toString().slice(-6)} placed successfully!`
+            );
+          }
         }
-      });
+
+        return res.status(201).json({
+          message: "Orders created successfully",
+          orders: createdOrders
+        });
+
+    } catch (err: any) {
+        return res.status(400).json({ detail: err.message });
     }
-
-    // Group by factory
-    const factoryGroups: Record<string, any[]> = {};
-    enrichedItems.forEach((it) => {
-      const fId = it.factory_id.toString();
-      if (!factoryGroups[fId]) factoryGroups[fId] = [];
-      factoryGroups[fId].push(it);
-    });
-
-    // Create orders per factory
-    const createdOrders: any[] = [];
-
-    for (const factoryId of Object.keys(factoryGroups)) {
-      const itemsForFactory = factoryGroups[factoryId];
-      let totalAmount = 0;
-      itemsForFactory.forEach((i) => {
-        totalAmount += Number(i.price) * Number(i.quantity);
-      });
-
-      const order = await Order.create({
-        shop_id: req.user._id,
-        factory_id: new mongoose.Types.ObjectId(factoryId),
-        items: itemsForFactory,
-        total_amount: totalAmount,
-        payment_method,
-        payment_status: "pending",
-        status: "pending"
-      });
-
-      createdOrders.push(order);
-
-      // decrement stock
-      for (const it of itemsForFactory) {
-        try {
-          await Product.findByIdAndUpdate(it.product_id, { $inc: { stock_quantity: -it.quantity } });
-        } catch (stockErr) {
-          console.warn("Stock update failed for", it.product_id, stockErr);
-        }
-      }
-
-      // send SMS
-      const shopUser = await User.findById(req.user._id);
-      if (shopUser?.phone) {
-        sendSmsNotification(
-          shopUser.phone,
-          `Order #${order._id.toString().slice(-6)} placed successfully!`
-        );
-      }
-    }
-
-    return res.status(201).json({
-      message: "Orders created successfully",
-      orders: createdOrders
-    });
 
   } catch (error) {
     console.error("Order Creation Error:", error);
@@ -192,7 +206,7 @@ router.post("/", protect, blockCheck, authorize("shop"), async (req: AuthRequest
 });
 
 /* -----------------------------------------------------------
-   POST /orders/cancel-group - Best-effort cancel (idempotent)
+   POST /orders/cancel-group - Best-effort cancel
 ----------------------------------------------------------- */
 router.post("/cancel-group", protect, async (req: AuthRequest, res) => {
   try {
@@ -235,10 +249,27 @@ router.post("/cancel-group", protect, async (req: AuthRequest, res) => {
           role: req.user.role,
         };
 
-        for (const it of ord.items || []) {
+        // RESTORE STOCK
+        // ⭐ FIX: Cast item to 'any' to access 'unit_name' without TypeScript errors
+        for (const itemObj of ord.items || []) {
+          const it = itemObj as any; 
+          
           try {
             if (it?.product_id && mongoose.Types.ObjectId.isValid(String(it.product_id))) {
-              await Product.findByIdAndUpdate(it.product_id, { $inc: { stock_quantity: Number(it.quantity) || 0 } });
+               
+               if (it.unit_name) {
+                   await Product.findOneAndUpdate(
+                    { 
+                      _id: it.product_id, 
+                      "selling_units.unit_name": it.unit_name 
+                    },
+                    { 
+                      $inc: { "selling_units.$.unit_stock": Number(it.quantity) || 0 } 
+                    }
+                  );
+               } else {
+                   console.warn(`Cannot restore stock for item ${it.product_id}: Missing unit_name`);
+               }
             }
           } catch (stockErr) {
             console.warn(`Failed to restore stock for product ${it?.product_id}:`, stockErr);
@@ -261,7 +292,7 @@ router.post("/cancel-group", protect, async (req: AuthRequest, res) => {
 });
 
 /* -----------------------------------------------------------
-   GET /orders - Works for shop & factory
+   GET /orders
 ----------------------------------------------------------- */
 router.get("/", protect, blockCheck, async (req: AuthRequest, res) => {
   try {

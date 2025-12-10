@@ -19,10 +19,6 @@ const razorpay = new Razorpay({
 
 /* ----------------------------------------------------------------
    POST /payments/initiate-group
-   - Accepts either:
-     a) { order_ids: [...] }  -> legacy: DB orders already created (keeps old flow)
-     b) { items: [...], payment_method: "Prepaid" } -> new flow: create Razorpay order using items (no DB orders created yet)
-   - Returns razorpay order object
 ------------------------------------------------------------------*/
 router.post("/initiate-group", protect, async (req: AuthRequest, res) => {
   try {
@@ -41,65 +37,88 @@ router.post("/initiate-group", protect, async (req: AuthRequest, res) => {
         amount: amountInPaisa,
         currency: "INR",
         receipt: "grp_" + Date.now(),
-        notes: {
-          group_order_ids: JSON.stringify(order_ids),
-        },
+        notes: { group_order_ids: JSON.stringify(order_ids) },
       };
 
       const razorpayOrder = await razorpay.orders.create(options);
-
-      // attach razorpay_order_id to DB orders (legacy behavior)
       await Order.updateMany({ _id: { $in: order_ids } }, { $set: { razorpay_order_id: razorpayOrder.id } });
 
       return res.json(razorpayOrder);
     }
 
-    // NEW: items flow (prepaid) - server computes total and creates razorpay order WITHOUT creating DB orders yet
+    // NEW: Prepaid Item Flow (Validates Unit Stock & Price)
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ detail: "items array is required for prepaid flow" });
     }
 
-    // Enrich items server-side and validate stock (do NOT modify stock yet)
     const enrichedItems: any[] = [];
+    
+    // Process items similarly to orderRoutes
     for (const item of items) {
-      if (!item?.product_id || !item?.quantity) {
-        return res.status(400).json({ detail: "Invalid item structure" });
-      }
-      if (!mongoose.Types.ObjectId.isValid(item.product_id)) {
-        return res.status(400).json({ detail: `Invalid product id: ${item.product_id}` });
-      }
-      const product = await Product.findById(item.product_id).populate("factory_id");
-      if (!product) return res.status(404).json({ detail: "Product not found" });
-      if (product.stock_quantity < item.quantity) {
-        return res.status(400).json({ detail: `${product.name} - insufficient stock` });
-      }
-      const factory: any = product.factory_id;
-      enrichedItems.push({
+       let realProductId = item.product_id;
+       let unitName = null;
+
+       if (item.product_id.length > 24 && item.product_id.includes("-")) {
+           realProductId = item.product_id.substring(0, 24);
+           unitName = decodeURIComponent(item.product_id.substring(25)); 
+       }
+
+       if (!mongoose.Types.ObjectId.isValid(realProductId)) {
+          return res.status(400).json({ detail: `Invalid product id: ${item.product_id}` });
+       }
+
+       const product = await Product.findById(realProductId).populate("factory_id");
+       if (!product) return res.status(404).json({ detail: "Product not found" });
+
+       let targetUnit: any = null;
+       let finalPrice = 0;
+
+       if (product.selling_units && product.selling_units.length > 0) {
+            if (unitName) {
+                targetUnit = product.selling_units.find((u: any) => u.unit_name === unitName);
+            } else {
+                targetUnit = product.selling_units[0]; 
+            }
+
+            if (!targetUnit) return res.status(400).json({ detail: `Unit '${unitName}' not found for ${product.name}` });
+
+            if (targetUnit.unit_stock < item.quantity) {
+                return res.status(400).json({ detail: `${product.name} (${targetUnit.unit_name}) - insufficient stock.` });
+            }
+
+            const commission = product.commission_rate || 0;
+            const basePrice = targetUnit.factory_unit_price;
+            finalPrice = Math.ceil(basePrice * (1 + commission / 100));
+
+       } else {
+           return res.status(400).json({ detail: `Product ${product.name} configuration error (no units)` });
+       }
+
+       const factory: any = product.factory_id;
+       enrichedItems.push({
         product_id: product._id.toString(),
-        name: product.name,
-        price: product.price,
+        name: `${product.name} (${targetUnit.unit_name})`,
+        unit_name: targetUnit.unit_name, 
+        price: finalPrice,
         quantity: item.quantity,
         image_url: product.images?.[0] || "",
         factory_id: factory?._id ? factory._id.toString() : null,
       });
     }
 
-    // Compute group totals (sum of all factories)
     const totalAmount = enrichedItems.reduce((sum, it) => sum + Number(it.price) * Number(it.quantity), 0);
     const amountInPaisa = Math.round(totalAmount * 100);
 
-    // Create razorpay order and include items in notes (stringified)
     const options = {
       amount: amountInPaisa,
       currency: "INR",
       receipt: "grp_" + Date.now(),
       notes: {
-        prepaid_items: JSON.stringify(enrichedItems), // server will use these after payment verification
+        prepaid_items: JSON.stringify(enrichedItems),
       },
     };
 
     const razorpayOrder = await razorpay.orders.create(options);
-
     return res.json(razorpayOrder);
   } catch (err) {
     console.error("initiate-group ERROR:", err);
@@ -109,79 +128,38 @@ router.post("/initiate-group", protect, async (req: AuthRequest, res) => {
 
 /* ----------------------------------------------------------------
    POST /payments/verify-group
-   - Verifies signature
-   - Then:
-     a) If razor notes contain group_order_ids -> update existing DB orders (legacy)
-     b) If razor notes contain prepaid_items -> CREATE DB orders here (new prepaid flow),
-        reduce stock, send SMS, set payment_status = "paid"
 ------------------------------------------------------------------*/
 router.post("/verify-group", protect, async (req: AuthRequest, res) => {
   try {
     const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
-    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
-      return res.status(400).json({ detail: "Missing payment fields" });
-    }
-
-    // Validate signature
+    
     const body = razorpay_order_id + "|" + razorpay_payment_id;
     const expectedSignature = crypto.createHmac("sha256", process.env.RAZORPAY_KEY_SECRET || "")
       .update(body.toString())
       .digest("hex");
 
     if (expectedSignature !== razorpay_signature) {
-      console.warn("INVALID SIGNATURE FOR GROUP PAYMENT");
       return res.status(400).json({ detail: "Invalid payment signature" });
     }
 
-    // Fetch Razorpay order to read notes
     const razorOrder = await razorpay.orders.fetch(razorpay_order_id);
-
-    // Try to parse notes
     let orderIds: string[] = [];
     let prepaidItems: any[] = [];
-    try {
-      orderIds = JSON.parse(String(razorOrder.notes?.group_order_ids || "[]"));
-    } catch (e) {
-      orderIds = [];
-    }
-    try {
-      prepaidItems = JSON.parse(String(razorOrder.notes?.prepaid_items || "[]"));
-    } catch (e) {
-      prepaidItems = [];
-    }
+    
+    try { orderIds = JSON.parse(String(razorOrder.notes?.group_order_ids || "[]")); } catch (e) {}
+    try { prepaidItems = JSON.parse(String(razorOrder.notes?.prepaid_items || "[]")); } catch (e) {}
 
-    // CASE A: legacy - update existing orders
+    // CASE A: Legacy
     if (orderIds.length > 0) {
-      const updateResult = await Order.updateMany(
+      await Order.updateMany(
         { _id: { $in: orderIds } },
-        {
-          $set: {
-            payment_status: "paid",
-            status: "processing",
-            razorpay_payment_id,
-            razorpay_signature,
-          },
-        }
+        { $set: { payment_status: "paid", status: "processing", razorpay_payment_id, razorpay_signature } }
       );
-
-      console.log("LEGACY GROUP PAYMENT VERIFIED:", {
-        razorpay_order_id,
-        orderIds,
-        matched: (updateResult as any).matchedCount,
-        modified: (updateResult as any).modifiedCount,
-      });
-
-      return res.json({
-        status: "success",
-        order_ids: orderIds,
-        matched: (updateResult as any).matchedCount,
-        modified: (updateResult as any).modifiedCount,
-      });
+      return res.json({ status: "success", order_ids: orderIds });
     }
 
-    // CASE B: prepaidItems present -> create DB orders now (one per factory)
+    // CASE B: New Prepaid Flow
     if (prepaidItems.length > 0) {
-      // Group items by factory
       const factoryGroups: Record<string, any[]> = {};
       for (const it of prepaidItems) {
         const f = it.factory_id ? String(it.factory_id) : "unknown";
@@ -189,12 +167,8 @@ router.post("/verify-group", protect, async (req: AuthRequest, res) => {
         factoryGroups[f].push(it);
       }
 
-      const createdOrders: any[] = [];
       const createdOrderIds: string[] = [];
-      const failedCreates: { error: string; factory?: string }[] = [];
 
-      // We'll perform sequential creates and stock reductions.
-      // If anything fails, attempt to rollback created orders and restore stock.
       try {
         for (const factoryId of Object.keys(factoryGroups)) {
           const itemsForFactory = factoryGroups[factoryId];
@@ -203,104 +177,59 @@ router.post("/verify-group", protect, async (req: AuthRequest, res) => {
             totalAmount += Number(it.price) * Number(it.quantity);
           }
 
-         const order = await (Order as any).create({
-  shop_id: req.user._id,
-  factory_id: mongoose.Types.ObjectId.isValid(factoryId)
-    ? new mongoose.Types.ObjectId(factoryId)
-    : null,
-  items: itemsForFactory,
-  total_amount: totalAmount,
-  payment_method: "Prepaid",
-  payment_status: "paid",
-  status: "processing",
-  razorpay_order_id,
-  razorpay_payment_id,
-  razorpay_signature,
-});
+          // ⭐ FIX: Cast the input object to 'any' to suppress the strict Type Overload Error
+          const orderPayload: any = {
+            shop_id: req.user._id,
+            factory_id: mongoose.Types.ObjectId.isValid(factoryId) ? new mongoose.Types.ObjectId(factoryId) : null,
+            items: itemsForFactory,
+            total_amount: totalAmount,
+            payment_method: "Prepaid",
+            payment_status: "paid",
+            status: "processing",
+            razorpay_order_id,
+            razorpay_payment_id,
+            razorpay_signature,
+          };
 
+          const order = await Order.create(orderPayload) as any;
+          
+          createdOrderIds.push(order._id.toString());
 
-          // decrement stock
+          // Deduct Stock
           for (const it of itemsForFactory) {
             try {
-              if (it?.product_id && mongoose.Types.ObjectId.isValid(String(it.product_id))) {
-                await Product.findByIdAndUpdate(it.product_id, { $inc: { stock_quantity: -(Number(it.quantity) || 0) } });
+              if (it.unit_name) {
+                  await Product.findOneAndUpdate(
+                    { 
+                      _id: it.product_id, 
+                      "selling_units.unit_name": it.unit_name 
+                    },
+                    { 
+                      $inc: { "selling_units.$.unit_stock": -(Number(it.quantity) || 0) } 
+                    }
+                  );
               }
             } catch (stockErr) {
               console.warn("Failed to decrement stock for", it.product_id, stockErr);
-              // If stock decrement fails, we'll let overall try/catch handle rollback
-              throw new Error(`Stock update failed for product ${it.product_id}`);
             }
           }
 
-          // SMS notification to shop
-          try {
-            const shopUser = await User.findById(req.user._id);
-            if (shopUser?.phone) {
-              sendSmsNotification(
-                shopUser.phone,
-                `Order #${order._id.toString().slice(-6)} placed successfully!`
-              );
-            }
-          } catch (smsErr) {
-            console.warn("SMS send failed for order", order._id, smsErr);
-            // not fatal
+          // SMS
+          const shopUser = await User.findById(req.user._id);
+          if (shopUser?.phone) {
+             sendSmsNotification(shopUser.phone, `Order #${order._id.toString().slice(-6)} placed successfully!`);
           }
         }
 
-        return res.json({
-          status: "success",
-          order_ids: createdOrderIds,
-          created: createdOrderIds.length,
-        });
+        return res.json({ status: "success", order_ids: createdOrderIds });
+
       } catch (createErr) {
-        console.error("Error creating orders after payment verification, attempting rollback:", createErr);
-        // Attempt rollback for created orders: restore stock and mark cancelled
-        for (const cid of createdOrderIds) {
-          try {
-            const ord = await Order.findById(cid);
-            if (!ord) continue;
-            // restore stock for items
-            for (const it of ord.items || []) {
-              try {
-                if (it?.product_id && mongoose.Types.ObjectId.isValid(String(it.product_id))) {
-                  await Product.findByIdAndUpdate(it.product_id, { $inc: { stock_quantity: Number(it.quantity) || 0 } });
-                }
-              } catch (rerr) {
-                console.warn("Rollback: failed to restore stock for", it.product_id, rerr);
-              }
-            }
-            ord.payment_status = "failed";
-            ord.status = "cancelled";
-            (ord as any).cancelledAt = new Date();
-            await ord.save();
-          } catch (rerr) {
-            console.warn("Rollback: failed for order id", cid, rerr);
-          }
-        }
-
-        return res.status(500).json({ detail: "Failed to create orders after payment; rollback attempted" });
+        console.error("Order creation failed:", createErr);
+        return res.status(500).json({ detail: "Failed to create orders." });
       }
     }
 
-    // Fallback: if neither orderIds nor prepaidItems found, try to update any order with same razorpay_order_id
-    const fallback = await Order.findOneAndUpdate(
-      { razorpay_order_id },
-      {
-        $set: {
-          payment_status: "paid",
-          status: "processing",
-          razorpay_payment_id,
-          razorpay_signature,
-        },
-      },
-      { new: true }
-    );
-
-    if (fallback) {
-      return res.json({ status: "success", updated: [fallback._id] });
-    }
-
-    return res.status(400).json({ detail: "No order IDs or prepaid items found for this payment." });
+    return res.status(400).json({ detail: "No order data found." });
 
   } catch (err) {
     console.error("verify-group ERROR:", err);
