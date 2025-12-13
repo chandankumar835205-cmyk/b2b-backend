@@ -26,6 +26,12 @@ router.post("/", protect, blockCheck, authorize("shop"), async (req: AuthRequest
       return res.status(400).json({ detail: "No items provided" });
     }
 
+    // --- Helper: Find the Admin User (to update wallet) ---
+    const adminUser = await User.findOne({ role: "admin" });
+    if (!adminUser) {
+        return res.status(500).json({ detail: "System Error: Admin account not found." });
+    }
+
     // Helper to process items (parse IDs, check stock, calculate price)
     const processItems = async (itemsList: any[]) => {
       const results: any[] = [];
@@ -51,6 +57,7 @@ router.post("/", protect, blockCheck, authorize("shop"), async (req: AuthRequest
         // 3. Find Specific Unit & Check Stock
         let targetUnit: any = null;
         let finalPrice = 0;
+        let factoryBasePrice = 0; // NEW: Track base price
 
         if (product.selling_units && product.selling_units.length > 0) {
              if (unitName) {
@@ -66,8 +73,8 @@ router.post("/", protect, blockCheck, authorize("shop"), async (req: AuthRequest
              }
 
              const commission = product.commission_rate || 0;
-             const basePrice = targetUnit.factory_unit_price;
-             finalPrice = Math.ceil(basePrice * (1 + commission / 100));
+             factoryBasePrice = targetUnit.factory_unit_price; // Store base
+             finalPrice = Math.ceil(factoryBasePrice * (1 + commission / 100));
 
         } else {
              throw new Error(`Product ${product.name} has no selling units defined.`);
@@ -78,8 +85,9 @@ router.post("/", protect, blockCheck, authorize("shop"), async (req: AuthRequest
         results.push({
           product_id: product._id,
           name: `${product.name} (${targetUnit.unit_name})`,
-          unit_name: targetUnit.unit_name, // Store Unit Name
+          unit_name: targetUnit.unit_name, 
           price: finalPrice,
+          factory_unit_price: factoryBasePrice, // NEW: Pass this along
           quantity: item.quantity,
           image_url: product.images?.[0] || "",
           factory_id: factory?._id,
@@ -98,7 +106,10 @@ router.post("/", protect, blockCheck, authorize("shop"), async (req: AuthRequest
 
     // --- PREPAID FLOW (Preview Only) ---
     if (String(payment_method).toLowerCase() === "prepaid") {
-      try {
+      // ... (Existing Prepaid logic remains unchanged) ...
+      // I am keeping your existing logic here for brevity, 
+      // but ensure you didn't delete the code block you already had here!
+       try {
         const enrichedItems = await processItems(items);
         
         const factoryGroups: Record<string, any[]> = {};
@@ -128,7 +139,7 @@ router.post("/", protect, blockCheck, authorize("shop"), async (req: AuthRequest
       }
     }
 
-    // --- COD FLOW (Create Orders) ---
+    // --- COD FLOW (Create Orders & Update Admin Wallet) ---
     try {
         const enrichedItems = await processItems(items);
 
@@ -143,23 +154,46 @@ router.post("/", protect, blockCheck, authorize("shop"), async (req: AuthRequest
 
         for (const factoryId of Object.keys(factoryGroups)) {
           const itemsForFactory = factoryGroups[factoryId];
-          let totalAmount = 0;
+          
+          let totalOrderAmount = 0;
+          let totalFactoryPayout = 0;
+          let totalAdminProfit = 0;
+
+          // CALCULATE SPLITS
           itemsForFactory.forEach((i) => {
-            totalAmount += Number(i.price) * Number(i.quantity);
+            const itemTotal = Number(i.price) * Number(i.quantity);
+            const itemFactoryTotal = Number(i.factory_unit_price) * Number(i.quantity);
+            
+            totalOrderAmount += itemTotal;
+            totalFactoryPayout += itemFactoryTotal;
+            // Admin gets the difference (Commission)
+            totalAdminProfit += (itemTotal - itemFactoryTotal);
           });
 
-          // Cast to 'any' to avoid strict type error
+          // CREATE ORDER WITH NEW FIELDS
           const order = await Order.create({
             shop_id: req.user._id,
             factory_id: new mongoose.Types.ObjectId(factoryId),
             items: itemsForFactory,
-            total_amount: totalAmount,
+            total_amount: totalOrderAmount,
+            
+            // ⭐ NEW: Store the calculated split
+            net_factory_payout: totalFactoryPayout,
+            admin_profit_share: totalAdminProfit,
+            is_factory_payout_released: false, // Default: Held
+
             payment_method,
             payment_status: "pending",
             status: "pending"
           }) as any;
 
           createdOrders.push(order);
+
+          // ⭐ NEW: IMMEDIATELY ADD TO ADMIN TOTAL REVENUE (WALLET)
+          // Admin sees the full cash flow (+105) immediately
+          await User.findByIdAndUpdate(adminUser._id, {
+             $inc: { wallet_balance: totalOrderAmount }
+          });
 
           // Decrement Stock
           for (const it of itemsForFactory) {
@@ -206,7 +240,7 @@ router.post("/", protect, blockCheck, authorize("shop"), async (req: AuthRequest
 });
 
 /* -----------------------------------------------------------
-   POST /orders/cancel-group - Best-effort cancel
+   POST /orders/cancel-group - Cancel & Deduct Admin Wallet
 ----------------------------------------------------------- */
 router.post("/cancel-group", protect, async (req: AuthRequest, res) => {
   try {
@@ -219,6 +253,9 @@ router.post("/cancel-group", protect, async (req: AuthRequest, res) => {
     if (validIds.length === 0) {
       return res.status(400).json({ detail: "No valid order IDs provided" });
     }
+    
+    // Find Admin for wallet deduction
+    const adminUser = await User.findOne({ role: "admin" });
 
     const query: any = { _id: { $in: validIds } };
     if (req.user.role === "shop") {
@@ -236,11 +273,13 @@ router.post("/cancel-group", protect, async (req: AuthRequest, res) => {
 
     for (const ord of orders) {
       try {
+        // Only allow cancel if pending
         if (String(ord.payment_status) !== "pending" && String(ord.status) !== "pending") {
           skipped.push(ord._id.toString());
           continue;
         }
 
+        // 1. UPDATE STATUS
         ord.payment_status = "failed";
         ord.status = "cancelled";
         (ord as any).cancelledAt = new Date();
@@ -248,15 +287,21 @@ router.post("/cancel-group", protect, async (req: AuthRequest, res) => {
           id: req.user._id,
           role: req.user.role,
         };
+        await ord.save();
 
-        // RESTORE STOCK
-        // ⭐ FIX: Cast item to 'any' to access 'unit_name' without TypeScript errors
+        // 2. ⭐ NEW: DEDUCT FROM ADMIN WALLET
+        // We remove the phantom revenue (-105) immediately
+        if (adminUser) {
+            await User.findByIdAndUpdate(adminUser._id, {
+                $inc: { wallet_balance: -(ord.total_amount || 0) }
+            });
+        }
+
+        // 3. RESTORE STOCK
         for (const itemObj of ord.items || []) {
           const it = itemObj as any; 
-          
           try {
             if (it?.product_id && mongoose.Types.ObjectId.isValid(String(it.product_id))) {
-               
                if (it.unit_name) {
                    await Product.findOneAndUpdate(
                     { 
@@ -267,8 +312,6 @@ router.post("/cancel-group", protect, async (req: AuthRequest, res) => {
                       $inc: { "selling_units.$.unit_stock": Number(it.quantity) || 0 } 
                     }
                   );
-               } else {
-                   console.warn(`Cannot restore stock for item ${it.product_id}: Missing unit_name`);
                }
             }
           } catch (stockErr) {
@@ -276,7 +319,6 @@ router.post("/cancel-group", protect, async (req: AuthRequest, res) => {
           }
         }
 
-        await ord.save();
         cancelled.push(ord._id.toString());
       } catch (innerErr: any) {
         console.error("Error cancelling order", ord._id, innerErr);

@@ -39,6 +39,14 @@ const orderSchema = new mongoose.Schema(
       enum: ["pending", "processing", "shipped", "delivered", "cancelled"],
       default: "pending"
     },
+    // We store this so future price changes don't affect past orders.
+    net_factory_payout: { type: Number, required: true, default: 0 },
+
+    // [NEW] 2. The Admin's profit (Commission - Discounts) for this specific order
+    admin_profit_share: { type: Number, required: true, default: 0 },
+
+    // [NEW] 3. The Switch: Has the admin clicked the "Add Revenue" button?
+    is_factory_payout_released: { type: Boolean, default: false },
 
     payment_status: {
       type: String,

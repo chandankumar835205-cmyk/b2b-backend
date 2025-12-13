@@ -72,6 +72,7 @@ router.post("/initiate-group", protect, async (req: AuthRequest, res) => {
 
        let targetUnit: any = null;
        let finalPrice = 0;
+       let factoryBasePrice = 0; // NEW variable
 
        if (product.selling_units && product.selling_units.length > 0) {
             if (unitName) {
@@ -87,8 +88,8 @@ router.post("/initiate-group", protect, async (req: AuthRequest, res) => {
             }
 
             const commission = product.commission_rate || 0;
-            const basePrice = targetUnit.factory_unit_price;
-            finalPrice = Math.ceil(basePrice * (1 + commission / 100));
+            factoryBasePrice = targetUnit.factory_unit_price; // Capture Base
+            finalPrice = Math.ceil(factoryBasePrice * (1 + commission / 100));
 
        } else {
            return res.status(400).json({ detail: `Product ${product.name} configuration error (no units)` });
@@ -100,6 +101,7 @@ router.post("/initiate-group", protect, async (req: AuthRequest, res) => {
         name: `${product.name} (${targetUnit.unit_name})`,
         unit_name: targetUnit.unit_name, 
         price: finalPrice,
+        factory_unit_price: factoryBasePrice, // ⭐ NEW: Send this to Razorpay notes
         quantity: item.quantity,
         image_url: product.images?.[0] || "",
         factory_id: factory?._id ? factory._id.toString() : null,
@@ -133,6 +135,10 @@ router.post("/verify-group", protect, async (req: AuthRequest, res) => {
   try {
     const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
     
+    // --- Helper: Find Admin for Wallet Update ---
+    const adminUser = await User.findOne({ role: "admin" });
+    // --------------------------------------------
+
     const body = razorpay_order_id + "|" + razorpay_payment_id;
     const expectedSignature = crypto.createHmac("sha256", process.env.RAZORPAY_KEY_SECRET || "")
       .update(body.toString())
@@ -149,7 +155,7 @@ router.post("/verify-group", protect, async (req: AuthRequest, res) => {
     try { orderIds = JSON.parse(String(razorOrder.notes?.group_order_ids || "[]")); } catch (e) {}
     try { prepaidItems = JSON.parse(String(razorOrder.notes?.prepaid_items || "[]")); } catch (e) {}
 
-    // CASE A: Legacy
+    // CASE A: Legacy (Update existing orders)
     if (orderIds.length > 0) {
       await Order.updateMany(
         { _id: { $in: orderIds } },
@@ -158,7 +164,7 @@ router.post("/verify-group", protect, async (req: AuthRequest, res) => {
       return res.json({ status: "success", order_ids: orderIds });
     }
 
-    // CASE B: New Prepaid Flow
+    // CASE B: New Prepaid Flow (Create Orders & Update Wallet)
     if (prepaidItems.length > 0) {
       const factoryGroups: Record<string, any[]> = {};
       for (const it of prepaidItems) {
@@ -172,17 +178,33 @@ router.post("/verify-group", protect, async (req: AuthRequest, res) => {
       try {
         for (const factoryId of Object.keys(factoryGroups)) {
           const itemsForFactory = factoryGroups[factoryId];
+          
           let totalAmount = 0;
+          let totalFactoryPayout = 0;
+          let totalAdminProfit = 0;
+
+          // CALCULATE SPLITS
           for (const it of itemsForFactory) {
-            totalAmount += Number(it.price) * Number(it.quantity);
+            const itemTotal = Number(it.price) * Number(it.quantity);
+            const itemFactoryTotal = Number(it.factory_unit_price || 0) * Number(it.quantity);
+            
+            totalAmount += itemTotal;
+            totalFactoryPayout += itemFactoryTotal;
+            totalAdminProfit += (itemTotal - itemFactoryTotal);
           }
 
-          // ⭐ FIX: Cast the input object to 'any' to suppress the strict Type Overload Error
+          // ⭐ FIX: Cast the input object to 'any'
           const orderPayload: any = {
             shop_id: req.user._id,
             factory_id: mongoose.Types.ObjectId.isValid(factoryId) ? new mongoose.Types.ObjectId(factoryId) : null,
             items: itemsForFactory,
             total_amount: totalAmount,
+            
+            // ⭐ NEW: Store the calculated split
+            net_factory_payout: totalFactoryPayout,
+            admin_profit_share: totalAdminProfit,
+            is_factory_payout_released: false, // Default: Held
+
             payment_method: "Prepaid",
             payment_status: "paid",
             status: "processing",
@@ -192,8 +214,14 @@ router.post("/verify-group", protect, async (req: AuthRequest, res) => {
           };
 
           const order = await Order.create(orderPayload) as any;
-          
           createdOrderIds.push(order._id.toString());
+
+          // ⭐ NEW: IMMEDIATELY ADD TO ADMIN WALLET
+          if (adminUser) {
+             await User.findByIdAndUpdate(adminUser._id, {
+                $inc: { wallet_balance: totalAmount }
+             });
+          }
 
           // Deduct Stock
           for (const it of itemsForFactory) {

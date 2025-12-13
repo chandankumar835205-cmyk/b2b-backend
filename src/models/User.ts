@@ -21,7 +21,12 @@ const userSchema = new mongoose.Schema(
      is_blocked: {
   type: Boolean,
   default: false,
-}
+},
+// [NEW] Stores the Total Revenue (for Factory) or Total GTV (for Admin)
+    wallet_balance: { type: Number, default: 0 },
+
+    // [NEW] Specific wallet for Admin to see pure Profit (Commission - Discounts)
+    admin_profit_wallet: { type: Number, default: 0 },
 
   },
   { timestamps: true }

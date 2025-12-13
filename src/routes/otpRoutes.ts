@@ -1,6 +1,7 @@
 import express from "express";
 import jwt from "jsonwebtoken";
 import User from "../models/User";
+import { sendSmsOtp } from "../utils/notificationService"; // <--- IMPORT THIS
 
 const router = express.Router();
 
@@ -19,11 +20,14 @@ router.post("/generate", async (req, res) => {
   const otp = Math.floor(1000 + Math.random() * 9000).toString();
   otpStore[phone] = otp;
 
-  // --- MOCK SMS ---
-  console.log(`================================`);
-  console.log(`🔑 OTP for ${phone} is: ${otp}`);
-  console.log(`================================`);
-  // ----------------
+  // --- REAL SMS SENDING ---
+  // We call the helper function but don't await it strictly if we want faster response
+  // (or await it if you want to confirm sending before responding)
+  await sendSmsOtp(phone, otp);
+  // ------------------------
+
+  // Log for development debugging (keep this if you want to see it in console too)
+  console.log(`🔑 Debug OTP for ${phone}: ${otp}`);
 
   res.json({ message: "OTP sent successfully" });
 });
@@ -32,8 +36,8 @@ router.post("/generate", async (req, res) => {
 router.post("/verify", async (req, res) => {
   const { phone, otp } = req.body;
   
+  // Check if OTP matches
   if (otpStore[phone] === otp) {
-    // Success! Log the user in
     const user = await User.findOne({ phone });
     if (!user) return res.status(404).json({ detail: "User not found" });
 
