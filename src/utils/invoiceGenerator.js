@@ -1,7 +1,6 @@
-import PDFDocument from "pdfkit";
-import { Response } from "express";
+const PDFDocument = require("pdfkit");
 
-export const generateInvoicePDF = (order: any, res: Response) => {
+const generateInvoicePDF = (order, res) => {
   try {
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader(
@@ -14,11 +13,11 @@ export const generateInvoicePDF = (order: any, res: Response) => {
 
     // 1️⃣ SENDER DETAILS
     const SENDER = order.items[0]?.seller_details || {
-        name: "B2B Platform",
-        address: "Platform HQ",
-        gstin: "N/A",
-        phone: "",
-        email: ""
+      name: "B2B Platform",
+      address: "Platform HQ",
+      gstin: "N/A",
+      phone: "",
+      email: ""
     };
 
     doc.fontSize(20).text("TAX INVOICE", { align: "center", underline: true }).moveDown(1.2);
@@ -49,7 +48,7 @@ export const generateInvoicePDF = (order: any, res: Response) => {
     doc.text(`Email: ${shop.email}`);
     doc.text(`Phone: ${shop.phone || "N/A"}`);
     doc.text(`Address: ${shop.address_line_1 || "N/A"}`);
-    if(shop.city) doc.text(`${shop.city}, ${shop.district || ''}, ${shop.state || ''} - ${shop.pincode || ''}`);
+    if (shop.city) doc.text(`${shop.city}, ${shop.district || ""}, ${shop.state || ""} - ${shop.pincode || ""}`);
     doc.moveDown(1.5);
 
     // 3️⃣ ORDER ITEMS TABLE
@@ -61,22 +60,22 @@ export const generateInvoicePDF = (order: any, res: Response) => {
     doc.fillColor("#000");
 
     const headerY = tableTop + 8;
-    doc.fontSize(11).font('Helvetica-Bold');
+    doc.fontSize(11).font("Helvetica-Bold");
     doc.text("Product (Unit)", 60, headerY);
-    doc.text("Qty", 300, headerY); // Moved Qty slightly right
+    doc.text("Qty", 300, headerY);
     doc.text("Price", 350, headerY);
     doc.text("Total", 430, headerY);
 
     doc.moveDown(2);
-    doc.font('Helvetica');
+    doc.font("Helvetica");
 
     let positionY = doc.y;
     
-    order.items.forEach((item: any) => {
+    order.items.forEach((item) => {
       // Check if we need a new page
       if (positionY > 700) {
-          doc.addPage();
-          positionY = 50;
+        doc.addPage();
+        positionY = 50;
       }
 
       // Allow name to wrap if long
@@ -96,7 +95,7 @@ export const generateInvoicePDF = (order: any, res: Response) => {
     doc.moveDown(2);
 
     // 4️⃣ TOTAL
-    doc.fontSize(14).font('Helvetica-Bold');
+    doc.fontSize(14).font("Helvetica-Bold");
     doc.text("Grand Total:", 350, positionY, { width: 100, align: "right" });
     doc.text(`₹${order.total_amount.toFixed(2)}`, 450, positionY, { width: 100, align: "right" });
 
@@ -105,4 +104,8 @@ export const generateInvoicePDF = (order: any, res: Response) => {
     console.error("PDF Error:", error);
     if (!res.headersSent) res.status(500).json({ detail: "Failed to generate invoice." });
   }
+};
+
+module.exports = {
+  generateInvoicePDF,
 };

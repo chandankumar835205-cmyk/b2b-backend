@@ -1,13 +1,12 @@
-// src/routes/paymentRoutes.ts
-import express from "express";
-import Razorpay from "razorpay";
-import crypto from "crypto";
-import Order from "../models/Order";
-import Product from "../models/Product";
-import User from "../models/User";
-import { protect, AuthRequest } from "../middleware/authMiddleware";
-import mongoose from "mongoose";
-import { sendSmsNotification } from "../utils/notificationService";
+const express = require("express");
+const Razorpay = require("razorpay");
+const crypto = require("crypto");
+const Order = require("../models/Order");
+const Product = require("../models/Product");
+const User = require("../models/User");
+const { protect } = require("../middleware/authMiddleware");
+const mongoose = require("mongoose");
+const { sendSmsNotification } = require("../utils/notificationService");
 
 const router = express.Router();
 
@@ -20,7 +19,7 @@ const razorpay = new Razorpay({
 /* ----------------------------------------------------------------
    POST /payments/initiate-group
 ------------------------------------------------------------------*/
-router.post("/initiate-group", protect, async (req: AuthRequest, res) => {
+router.post("/initiate-group", protect, async (req, res) => {
   try {
     const { order_ids, items } = req.body;
 
@@ -51,57 +50,57 @@ router.post("/initiate-group", protect, async (req: AuthRequest, res) => {
       return res.status(400).json({ detail: "items array is required for prepaid flow" });
     }
 
-    const enrichedItems: any[] = [];
+    const enrichedItems = [];
     
     // Process items similarly to orderRoutes
     for (const item of items) {
-       let realProductId = item.product_id;
-       let unitName = null;
+      let realProductId = item.product_id;
+      let unitName = null;
 
-       if (item.product_id.length > 24 && item.product_id.includes("-")) {
-           realProductId = item.product_id.substring(0, 24);
-           unitName = decodeURIComponent(item.product_id.substring(25)); 
-       }
+      if (item.product_id.length > 24 && item.product_id.includes("-")) {
+        realProductId = item.product_id.substring(0, 24);
+        unitName = decodeURIComponent(item.product_id.substring(25)); 
+      }
 
-       if (!mongoose.Types.ObjectId.isValid(realProductId)) {
-          return res.status(400).json({ detail: `Invalid product id: ${item.product_id}` });
-       }
+      if (!mongoose.Types.ObjectId.isValid(realProductId)) {
+        return res.status(400).json({ detail: `Invalid product id: ${item.product_id}` });
+      }
 
-       const product = await Product.findById(realProductId).populate("factory_id");
-       if (!product) return res.status(404).json({ detail: "Product not found" });
+      const product = await Product.findById(realProductId).populate("factory_id");
+      if (!product) return res.status(404).json({ detail: "Product not found" });
 
-       let targetUnit: any = null;
-       let finalPrice = 0;
-       let factoryBasePrice = 0; // NEW variable
+      let targetUnit = null;
+      let finalPrice = 0;
+      let factoryBasePrice = 0;
 
-       if (product.selling_units && product.selling_units.length > 0) {
-            if (unitName) {
-                targetUnit = product.selling_units.find((u: any) => u.unit_name === unitName);
-            } else {
-                targetUnit = product.selling_units[0]; 
-            }
+      if (product.selling_units && product.selling_units.length > 0) {
+        if (unitName) {
+          targetUnit = product.selling_units.find((u) => u.unit_name === unitName);
+        } else {
+          targetUnit = product.selling_units[0]; 
+        }
 
-            if (!targetUnit) return res.status(400).json({ detail: `Unit '${unitName}' not found for ${product.name}` });
+        if (!targetUnit) return res.status(400).json({ detail: `Unit '${unitName}' not found for ${product.name}` });
 
-            if (targetUnit.unit_stock < item.quantity) {
-                return res.status(400).json({ detail: `${product.name} (${targetUnit.unit_name}) - insufficient stock.` });
-            }
+        if (targetUnit.unit_stock < item.quantity) {
+          return res.status(400).json({ detail: `${product.name} (${targetUnit.unit_name}) - insufficient stock.` });
+        }
 
-            const commission = product.commission_rate || 0;
-            factoryBasePrice = targetUnit.factory_unit_price; // Capture Base
-            finalPrice = Math.ceil(factoryBasePrice * (1 + commission / 100));
+        const commission = product.commission_rate || 0;
+        factoryBasePrice = targetUnit.factory_unit_price;
+        finalPrice = Math.ceil(factoryBasePrice * (1 + commission / 100));
 
-       } else {
-           return res.status(400).json({ detail: `Product ${product.name} configuration error (no units)` });
-       }
+      } else {
+        return res.status(400).json({ detail: `Product ${product.name} configuration error (no units)` });
+      }
 
-       const factory: any = product.factory_id;
-       enrichedItems.push({
+      const factory = product.factory_id;
+      enrichedItems.push({
         product_id: product._id.toString(),
         name: `${product.name} (${targetUnit.unit_name})`,
         unit_name: targetUnit.unit_name, 
         price: finalPrice,
-        factory_unit_price: factoryBasePrice, // ⭐ NEW: Send this to Razorpay notes
+        factory_unit_price: factoryBasePrice,
         quantity: item.quantity,
         image_url: product.images?.[0] || "",
         factory_id: factory?._id ? factory._id.toString() : null,
@@ -124,20 +123,19 @@ router.post("/initiate-group", protect, async (req: AuthRequest, res) => {
     return res.json(razorpayOrder);
   } catch (err) {
     console.error("initiate-group ERROR:", err);
-    return res.status(500).json({ detail: (err as Error).message });
+    return res.status(500).json({ detail: err.message });
   }
 });
 
 /* ----------------------------------------------------------------
    POST /payments/verify-group
 ------------------------------------------------------------------*/
-router.post("/verify-group", protect, async (req: AuthRequest, res) => {
+router.post("/verify-group", protect, async (req, res) => {
   try {
     const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
     
-    // --- Helper: Find Admin for Wallet Update ---
+    // Find Admin for Wallet Update
     const adminUser = await User.findOne({ role: "admin" });
-    // --------------------------------------------
 
     const body = razorpay_order_id + "|" + razorpay_payment_id;
     const expectedSignature = crypto.createHmac("sha256", process.env.RAZORPAY_KEY_SECRET || "")
@@ -149,8 +147,8 @@ router.post("/verify-group", protect, async (req: AuthRequest, res) => {
     }
 
     const razorOrder = await razorpay.orders.fetch(razorpay_order_id);
-    let orderIds: string[] = [];
-    let prepaidItems: any[] = [];
+    let orderIds = [];
+    let prepaidItems = [];
     
     try { orderIds = JSON.parse(String(razorOrder.notes?.group_order_ids || "[]")); } catch (e) {}
     try { prepaidItems = JSON.parse(String(razorOrder.notes?.prepaid_items || "[]")); } catch (e) {}
@@ -166,14 +164,14 @@ router.post("/verify-group", protect, async (req: AuthRequest, res) => {
 
     // CASE B: New Prepaid Flow (Create Orders & Update Wallet)
     if (prepaidItems.length > 0) {
-      const factoryGroups: Record<string, any[]> = {};
+      const factoryGroups = {};
       for (const it of prepaidItems) {
         const f = it.factory_id ? String(it.factory_id) : "unknown";
         if (!factoryGroups[f]) factoryGroups[f] = [];
         factoryGroups[f].push(it);
       }
 
-      const createdOrderIds: string[] = [];
+      const createdOrderIds = [];
 
       try {
         for (const factoryId of Object.keys(factoryGroups)) {
@@ -193,18 +191,14 @@ router.post("/verify-group", protect, async (req: AuthRequest, res) => {
             totalAdminProfit += (itemTotal - itemFactoryTotal);
           }
 
-          // ⭐ FIX: Cast the input object to 'any'
-          const orderPayload: any = {
+          const orderPayload = {
             shop_id: req.user._id,
             factory_id: mongoose.Types.ObjectId.isValid(factoryId) ? new mongoose.Types.ObjectId(factoryId) : null,
             items: itemsForFactory,
             total_amount: totalAmount,
-            
-            // ⭐ NEW: Store the calculated split
             net_factory_payout: totalFactoryPayout,
             admin_profit_share: totalAdminProfit,
-            is_factory_payout_released: false, // Default: Held
-
+            is_factory_payout_released: false,
             payment_method: "Prepaid",
             payment_status: "paid",
             status: "processing",
@@ -213,29 +207,29 @@ router.post("/verify-group", protect, async (req: AuthRequest, res) => {
             razorpay_signature,
           };
 
-          const order = await Order.create(orderPayload) as any;
+          const order = await Order.create(orderPayload);
           createdOrderIds.push(order._id.toString());
 
-          // ⭐ NEW: IMMEDIATELY ADD TO ADMIN WALLET
+          // Update Admin Wallet
           if (adminUser) {
-             await User.findByIdAndUpdate(adminUser._id, {
-                $inc: { wallet_balance: totalAmount }
-             });
+            await User.findByIdAndUpdate(adminUser._id, {
+              $inc: { wallet_balance: totalAmount }
+            });
           }
 
           // Deduct Stock
           for (const it of itemsForFactory) {
             try {
               if (it.unit_name) {
-                  await Product.findOneAndUpdate(
-                    { 
-                      _id: it.product_id, 
-                      "selling_units.unit_name": it.unit_name 
-                    },
-                    { 
-                      $inc: { "selling_units.$.unit_stock": -(Number(it.quantity) || 0) } 
-                    }
-                  );
+                await Product.findOneAndUpdate(
+                  { 
+                    _id: it.product_id, 
+                    "selling_units.unit_name": it.unit_name 
+                  },
+                  { 
+                    $inc: { "selling_units.$.unit_stock": -(Number(it.quantity) || 0) } 
+                  }
+                );
               }
             } catch (stockErr) {
               console.warn("Failed to decrement stock for", it.product_id, stockErr);
@@ -245,7 +239,7 @@ router.post("/verify-group", protect, async (req: AuthRequest, res) => {
           // SMS
           const shopUser = await User.findById(req.user._id);
           if (shopUser?.phone) {
-             sendSmsNotification(shopUser.phone, `Order #${order._id.toString().slice(-6)} placed successfully!`);
+            sendSmsNotification(shopUser.phone, `Order #${order._id.toString().slice(-6)} placed successfully!`);
           }
         }
 
@@ -261,8 +255,8 @@ router.post("/verify-group", protect, async (req: AuthRequest, res) => {
 
   } catch (err) {
     console.error("verify-group ERROR:", err);
-    return res.status(500).json({ detail: (err as Error).message });
+    return res.status(500).json({ detail: err.message });
   }
 });
 
-export default router;
+module.exports = router;
